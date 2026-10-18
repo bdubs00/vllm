@@ -8,6 +8,7 @@ from pydantic import model_validator
 from vllm.config.utils import config, get_hash_factors, hash_factors
 
 if TYPE_CHECKING:
+    from vllm.config.load import LoadConfig
     from vllm.config.model import ModelConfig
     from vllm.config.parallel import ParallelConfig
 
@@ -18,6 +19,16 @@ _NGRAM_LAYER_FIELDS = {
     "Qwen4ExpForCausalLM": "ple_layer_ids",
     "Qwen4ExpForConditionalGeneration": "ple_layer_ids",
 }
+
+# Architectures whose model state stages n-gram rows from the checkpoint
+# files, so a new n-gram model does not get disk_offload by default.
+_DISK_OFFLOAD_ARCHITECTURES = frozenset(
+    {
+        "DeepseekV41ForCausalLM",
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
+    }
+)
 
 
 def model_has_engram_layers(model_config: "ModelConfig | None") -> bool:
@@ -38,9 +49,9 @@ class EngramConfig:
     """Store embedding weights in pinned CPU memory for UVA lookup."""
 
     disk_offload: bool = False
-    """Keep Qwen4Exp PLE tables in the checkpoint files and read each step's
-    rows on the host instead of allocating the table. Takes precedence over
-    cpu_offload."""
+    """Keep n-gram tables in the checkpoint files and read each step's rows on
+    the host instead of allocating the table. Takes precedence over
+    cpu_offload. Requires Model Runner V2 and lazy safetensors loading."""
 
     embedding_across_dp: bool = False
     """Shard embeddings across TP and all DP ranks when enabled.
@@ -61,6 +72,14 @@ class EngramConfig:
 
     @model_validator(mode="after")
     def _validate_shared_memory(self) -> Self:
+        if self.disk_offload:
+            if self.dp_shared_memory:
+                raise ValueError(
+                    "disk_offload cannot be combined with dp_shared_memory"
+                )
+            if self.use_thp:
+                raise ValueError("disk_offload cannot be combined with use_thp")
+            self.cpu_offload = False
         if self.dp_shared_memory and not self.cpu_offload:
             raise ValueError("dp_shared_memory requires cpu_offload=True")
         if self.use_thp and (not self.cpu_offload or self.dp_shared_memory):
@@ -88,8 +107,36 @@ class EngramConfig:
         if self.disk_offload:
             from vllm.platforms import current_platform
 
-            if field != "ple_layer_ids" or not current_platform.is_cuda():
-                raise ValueError("disk_offload requires a Qwen4Exp model on CUDA")
+            if (
+                model_config.architecture not in _DISK_OFFLOAD_ARCHITECTURES
+                or not current_platform.is_cuda()
+            ):
+                raise ValueError(
+                    "disk_offload requires CUDA and one of "
+                    f"{sorted(_DISK_OFFLOAD_ARCHITECTURES)}"
+                )
+
+    def verify_disk_offload(
+        self, load_config: "LoadConfig", use_v2_model_runner: bool
+    ) -> None:
+        """Reject runners and loaders that cannot serve disk-offloaded tables."""
+        if not use_v2_model_runner:
+            raise ValueError("disk_offload requires Model Runner V2")
+        if load_config.load_format not in ("auto", "safetensors", "dummy"):
+            raise ValueError(
+                "disk_offload reads lazy safetensors views and does not support "
+                f"load_format {load_config.load_format!r}"
+            )
+        # Both read whole checkpoint files into memory before handing them over.
+        extra_config = load_config.model_loader_extra_config
+        if load_config.safetensors_load_strategy == "eager" or (
+            isinstance(extra_config, dict)
+            and extra_config.get("enable_multithread_load")
+        ):
+            raise ValueError(
+                "disk_offload does not support eager or multithreaded "
+                "safetensors loading"
+            )
 
     def resolve_dp_shared_memory(self, parallel_config: "ParallelConfig") -> None:
         """Share host tables by default wherever the configuration permits."""

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import replace
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -12,6 +12,8 @@ from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group
 from vllm.forward_context import BatchDescriptor, DPMetadata, create_forward_context
+from vllm.models.deepseek_v41.common.engram import DEAD_ID, Engram, NgramHashState
+from vllm.models.deepseek_v41.common.mm_preprocess import image_sentinel_mask
 from vllm.models.deepseek_v41.decoder_replay_layers import (
     DecoderReplayLayers,
     ReplayBatch,
@@ -20,6 +22,7 @@ from vllm.models.deepseek_v41.nvidia.decoder_replay_cudagraph import (
     DecoderReplayCudaGraphManager,
 )
 from vllm.triton_utils import tl, triton
+from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadataBuilder
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.core.sched.output import NewRequestData
@@ -192,6 +195,10 @@ class DeepseekV41ModelState(DefaultModelState):
     with metadata and a forward context of its own, like a microbatch.
     """
 
+    # Disk-offloaded Engram rows are staged before the forward, so its graphs
+    # read fixed buffers; the forward takes the batch's hashes.
+    _engram_disk: tuple[NgramHashState, list[Engram]] | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -210,6 +217,28 @@ class DeepseekV41ModelState(DefaultModelState):
             self.lookback_token_ids = torch.full(
                 (max_num_reqs, depth), -1, dtype=torch.int32, device=device
             )
+
+        disk_layers = [
+            module
+            for module in model.modules()
+            if isinstance(module, Engram) and module.embed_tokens.disk_offload
+        ]
+        if disk_layers:
+            hash_state = next(
+                module
+                for module in model.modules()
+                if isinstance(module, NgramHashState)
+            )
+            self._engram_disk = (hash_state, disk_layers)
+            layout = hash_state.layout
+            shape = (self.max_num_tokens, len(layout.layer_ids), layout.n_hash_cols)
+            self._engram_hashes = torch.full(
+                shape, DEAD_ID, dtype=torch.int32, device=device
+            )
+            self._engram_host_hashes = torch.empty(
+                shape, dtype=torch.int32, device="cpu", pin_memory=True
+            )
+            self._engram_attn_metadata: dict[str, Any] = {}
 
         # Per request state index; batches gather from it (see prepare_attn).
         self._replay_start_np = np.zeros(self.max_num_reqs, dtype=np.int32)
@@ -303,7 +332,49 @@ class DeepseekV41ModelState(DefaultModelState):
             BLOCK_DEPTH=triton.next_power_of_2(depth),
         )
         model_inputs["lookback_token_ids"] = window
+        if self._engram_disk is not None:
+            hashes = self._stage_engram_disk_rows(input_batch, window)
+            if hashes is not None:
+                model_inputs["engram_hashes"] = hashes
         return model_inputs
+
+    def _stage_engram_disk_rows(
+        self, input_batch: InputBatch, lookback_token_ids: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Hash the batch and stage its disk-offloaded Engram rows behind one
+        stream sync; None while the KV cache is unbound (profile runs).
+
+        The hashes cover this step's tokens, which the previous step samples
+        on the GPU, so the host read has to wait for them.
+        """
+        assert self._engram_disk is not None
+        hash_state, layers = self._engram_disk
+        if not hash_state.ensure_cache():
+            return None
+        prefix = cast(str, hash_state.swa_cache_module.prefix)
+        swa_metadata = self._engram_attn_metadata[prefix]
+        input_ids = input_batch.input_ids
+        num_tokens = input_ids.shape[0]
+        hashes = self._engram_hashes[:num_tokens]
+        hashes.copy_(
+            hash_state(
+                input_ids,
+                input_batch.positions,
+                swa_metadata.query_start_loc,
+                image_sentinel_mask(input_ids),
+                lookback_token_ids,
+                image_sentinel_mask(lookback_token_ids),
+                swa_metadata.slot_mapping,
+                swa_metadata.block_table,
+            )
+        )
+        host_hashes = self._engram_host_hashes[:num_tokens]
+        host_hashes.copy_(hashes, non_blocking=True)
+        with gpu_sync_allowed():
+            torch.accelerator.current_stream().synchronize()
+        for layer in layers:
+            layer.stage_disk_rows(host_hashes[:, layer.layer_hash_index])
+        return hashes
 
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
         model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
@@ -311,6 +382,12 @@ class DeepseekV41ModelState(DefaultModelState):
             # The captured graph reads this buffer; replays refill it in place.
             self.lookback_token_ids.fill_(-1)
             model_inputs["lookback_token_ids"] = self.lookback_token_ids
+        if self._engram_disk is not None:
+            # Captured graphs read the staged rows; real steps restage them.
+            for layer in self._engram_disk[1]:
+                layer.staged_rows[:num_tokens].zero_()
+            hashes = self._engram_hashes[:num_tokens].fill_(DEAD_ID)
+            model_inputs["engram_hashes"] = hashes
         return model_inputs
 
     def prepare_attn(
@@ -396,6 +473,8 @@ class DeepseekV41ModelState(DefaultModelState):
                 kv_cache_config,
                 replay_start,
             )
+        if self._engram_disk is not None:
+            self._engram_attn_metadata = attn_metadata
         return attn_metadata
 
     def _warm_up_replay_kernels(

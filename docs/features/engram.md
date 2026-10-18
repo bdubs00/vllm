@@ -96,20 +96,24 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash \
 CPU offload requires a GPU with UVA support;
 vLLM fails fast when it is unavailable.
 
-## Disk offload (Qwen4Exp)
+## Disk offload
 
-`disk_offload` keeps Qwen4Exp PLE tables in the checkpoint files: no table
-is allocated in GPU or pinned host memory, and nothing is copied to an offload
-directory. Each step reads that step's rows from the safetensors files on the
-host. Use it where neither `cpu_offload` nor a resident table fits, for example
-on unified-memory GPUs such as DGX Spark, where pinned host memory comes out of
-the same pool as the weights and the KV cache:
+`disk_offload` keeps Qwen4Exp PLE and DeepSeek V4.1 Engram tables in the
+checkpoint files: no table is allocated in GPU or pinned host memory, and
+nothing is copied to an offload directory. Each step reads that step's rows
+from the safetensors files on the host. Use it where neither `cpu_offload` nor
+a resident table fits, for example on unified-memory GPUs such as DGX Spark,
+where pinned host memory comes out of the same pool as the weights and the KV
+cache:
 
 ```bash
-vllm serve <qwen4exp-checkpoint> --engram-config '{"disk_offload": true}'
+vllm serve <checkpoint> --engram-config '{"disk_offload": true}'
 ```
 
-It applies only to Qwen4Exp on CUDA and takes precedence over `cpu_offload`.
+It requires CUDA and Model Runner V2, and it takes precedence over
+`cpu_offload`. DeepSeek V4.1 keeps the ue8m0 block scales, about 3% of the
+table, in host memory and reads only the FP8 values from the files. Each of
+its TP ranks reads only the rows of its own hash heads.
 
 Rows are read with `preadv` and copied to fixed device buffers before the
 forward, so CUDA graphs replay unchanged. They stay in the checkpoint format
@@ -121,7 +125,7 @@ and reclaimed by the kernel under memory pressure.
 Costs and limits:
 
 - The read needs the step's token ids, so it waits for the previous step on
-  the GPU, and every TP rank reads all of its rows.
+  the GPU. Every Qwen4Exp TP rank reads all of the step's rows.
 - A row that is not in the page cache is read from disk. For a fast first
   request, read the PLE shard files once after the server has started.
 - The checkpoint files must not change while the server runs. Truncation stops
@@ -130,6 +134,10 @@ Costs and limits:
   not file-backed safetensors views (`.bin`, runai, `fastsafetensors`,
   `instanttensor`, or `--safetensors-load-strategy eager`);
   `--load-format dummy` serves zeros.
+- At startup, vLLM rejects load formats other than `auto`, `safetensors` and
+  `dummy`. It also rejects eager and multithreaded safetensors loading,
+  because both read whole checkpoint files into memory.
+- DeepSeek V4.1 does not support `disk_offload` with `embedding_across_dp`.
 
 ## Data-parallel topologies (DeepSeek V4.1)
 

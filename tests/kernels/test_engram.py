@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from safetensors import safe_open
+from safetensors.torch import save_file
 
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
     dequant_mxfp8_to_bf16,
@@ -571,6 +573,7 @@ def _make_embedding(cpu_offload, rows=4096, dim=256, block=32):
     layer.head_start = 0
     layer.cpu_offload = cpu_offload
     layer.dp_shared_memory = False
+    layer.disk_offload = False
     layer.part_num_embeddings = rows
     # A window strictly inside the table, so unowned rows are exercised too.
     layer.vocab_start_idx, layer.vocab_end_idx = rows // 4, rows // 4 + rows // 2
@@ -612,14 +615,23 @@ def test_engram_rejects_empty_head_shards(tp_size, dp_size, n_heads, monkeypatch
     not current_platform.is_cuda_alike(), reason="CUDA or ROCm required"
 )
 @pytest.mark.parametrize(
-    "cpu_offload,sort_rows", [(False, False), (True, False), (True, True)]
+    "cpu_offload,sort_rows,disk_offload",
+    [
+        (False, False, False),
+        (True, False, False),
+        (True, True, False),
+        (False, False, True),
+    ],
 )
 @pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
 def test_engram_head_shards_reconstruct_checkpoint(
-    cpu_offload, sort_rows, tp_size, monkeypatch
+    cpu_offload, sort_rows, disk_offload, tp_size, monkeypatch, tmp_path
 ):
     """Keep complete buckets and reconstruct head order, including TP padding,
-    whether or not the host lookup sorts its rows by table offset."""
+    whether or not the host lookup sorts its rows by table offset, and when
+    each rank stages its values from the checkpoint file."""
+    if disk_offload and not current_platform.is_cuda():
+        pytest.skip("disk offload is CUDA-only")
     if sort_rows:
         monkeypatch.setattr(
             engram_ops, "_engram_lookup_thresholds", lambda _: (0, None)
@@ -638,6 +650,11 @@ def test_engram_head_shards_reconstruct_checkpoint(
         start += size
     ids = hashes[:, 1]
     expected = _reference_lookup(weight.cuda(), scales.cuda(), ids, 0, num_rows)
+    if disk_offload:
+        path = tmp_path / "engram.safetensors"
+        save_file({"weight": weight}, str(path))
+        with safe_open(path, framework="pt") as checkpoint:
+            weight = checkpoint.get_tensor("weight")
     monkeypatch.setattr(
         engram_ops, "get_tensor_model_parallel_world_size", lambda: tp_size
     )
@@ -649,12 +666,18 @@ def test_engram_head_shards_reconstruct_checkpoint(
         )
         with torch.device("cuda"):
             layer = ParallelEngramEmbedding(
-                num_rows + 7, dim, head_sizes, cpu_offload=cpu_offload
+                num_rows + 7,
+                dim,
+                head_sizes,
+                cpu_offload=cpu_offload,
+                disk_offload=disk_offload,
+                max_tokens=len(ids),
             )
         layer.weight.weight_loader(layer.weight, weight)
         layer.weight_scale_inv.weight_loader(
             layer.weight_scale_inv, scales.view(torch.float8_e8m0fnu)
         )
+        layer.finalize_disk(dummy=False)
         out = torch.empty(
             len(ids),
             layer.part_n_hash_cols,
@@ -662,7 +685,10 @@ def test_engram_head_shards_reconstruct_checkpoint(
             device="cuda",
             dtype=torch.bfloat16,
         )
-        layer.lookup(ids, out)
+        if disk_offload:
+            layer.stage_disk_rows(ids.cpu(), out)
+        else:
+            layer.lookup(ids, out)
         shards.append(out)
         layers.append(layer)
     gathered = torch.cat(shards, dim=1)
@@ -675,13 +701,17 @@ def test_engram_head_shards_reconstruct_checkpoint(
         return torch.cat(shards, dim=dim)
 
     monkeypatch.setattr(engram_ops, "tensor_model_parallel_all_gather", gather)
-    torch.testing.assert_close(layers[0](ids), expected, rtol=0, atol=0)
+    if not disk_offload:
+        torch.testing.assert_close(layers[0](ids), expected, rtol=0, atol=0)
     module = Engram.__new__(Engram)
     torch.nn.Module.__init__(module)
     module.embed_tokens = layers[0]
     module.use_sequence_parallel = False
     module.staged_rows = torch.empty_like(shards[0])
-    module.prepare_embeddings(ids)
+    if disk_offload:
+        module.stage_disk_rows(ids.cpu())
+    else:
+        module.prepare_embeddings(ids)
     torch.testing.assert_close(module.embed(ids), expected, rtol=0, atol=0)
     # Slicing before head reordering must preserve padded heads and tokens.
     module.use_sequence_parallel = True

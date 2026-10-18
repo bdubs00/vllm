@@ -17,6 +17,7 @@ import torch
 from huggingface_hub import ResolvedRevision
 from pydantic import ValidationError
 
+import vllm.config.engram as engram_config_module
 import vllm.config.vllm as vllm_config_module
 import vllm.envs as envs
 from vllm.compilation.backends import VllmBackend
@@ -1817,23 +1818,23 @@ def test_engram_draft_config_validates_target(monkeypatch, target_has_ple, expli
 
 
 @pytest.mark.parametrize(
-    ("architecture", "layer_field", "rocm", "expect_error"),
+    ("architecture", "layer_field", "supported"),
     [
-        pytest.param(
-            "DeepseekV41ForCausalLM", "engram_layer_ids", False, True, id="deepseek"
-        ),
-        pytest.param(
-            "Qwen4ExpForCausalLM", "ple_layer_ids", True, True, id="qwen4exp_rocm"
-        ),
-        pytest.param(
-            "Qwen4ExpForCausalLM", "ple_layer_ids", False, False, id="qwen4exp_cuda"
-        ),
+        ("DeepseekV41ForCausalLM", "engram_layer_ids", True),
+        ("Qwen4ExpForCausalLM", "ple_layer_ids", True),
+        ("Qwen4ExpForConditionalGeneration", "ple_layer_ids", True),
+        # An n-gram model whose model state does not stage disk rows.
+        ("FutureNgramForCausalLM", "ngram_layer_ids", False),
     ],
 )
-def test_engram_disk_offload_requires_cuda_qwen4exp(
-    monkeypatch, architecture, layer_field, rocm, expect_error
+@pytest.mark.parametrize("rocm", [False, True])
+def test_engram_disk_offload_requires_supported_model_on_cuda(
+    monkeypatch, architecture, layer_field, supported, rocm
 ):
     monkeypatch.setattr(current_platform, "is_cuda", lambda: not rocm)
+    monkeypatch.setitem(
+        engram_config_module._NGRAM_LAYER_FIELDS, architecture, layer_field
+    )
     model = cast(
         ModelConfig,
         SimpleNamespace(
@@ -1842,11 +1843,47 @@ def test_engram_disk_offload_requires_cuda_qwen4exp(
         ),
     )
     config = EngramConfig(disk_offload=True)
-    if expect_error:
-        with pytest.raises(ValueError, match="disk_offload"):
-            config.verify_model_config(model)
-    else:
+    if supported and not rocm:
         config.verify_model_config(model)
+    else:
+        with pytest.raises(ValueError, match="disk_offload requires CUDA and one of"):
+            config.verify_model_config(model)
+
+
+def test_engram_disk_offload_replaces_host_placements():
+    assert EngramConfig(disk_offload=True).cpu_offload is False
+    with pytest.raises(ValueError, match="dp_shared_memory"):
+        EngramConfig(disk_offload=True, dp_shared_memory=True)
+    with pytest.raises(ValueError, match="use_thp"):
+        EngramConfig(disk_offload=True, use_thp=True)
+
+
+@pytest.mark.parametrize(
+    ("load_kwargs", "use_v2_model_runner", "error"),
+    [
+        ({}, True, None),
+        ({"load_format": "dummy"}, True, None),
+        ({}, False, "Model Runner V2"),
+        ({"load_format": "fastsafetensors"}, True, "load_format"),
+        ({"safetensors_load_strategy": "eager"}, True, "eager"),
+        (
+            {"model_loader_extra_config": {"enable_multithread_load": True}},
+            True,
+            "multithreaded",
+        ),
+    ],
+)
+def test_engram_disk_offload_rejects_unservable_loading(
+    load_kwargs, use_v2_model_runner, error
+):
+    """Loaders that copy whole files would exhaust host memory before failing."""
+    config = EngramConfig(disk_offload=True)
+    load_config = LoadConfig(**load_kwargs)
+    if error is None:
+        config.verify_disk_offload(load_config, use_v2_model_runner)
+    else:
+        with pytest.raises(ValueError, match=error):
+            config.verify_disk_offload(load_config, use_v2_model_runner)
 
 
 def test_engram_hash_tracks_execution_options():

@@ -1458,6 +1458,10 @@ class VllmConfig:
         self.engram_config.verify_model_config(model_config)
         self.engram_config.resolve_dp_shared_memory(self.parallel_config)
         self.engram_config.verify_parallel_config(self.parallel_config)
+        if self.engram_config.disk_offload:
+            self.engram_config.verify_disk_offload(
+                self.load_config, self.use_v2_model_runner
+            )
         logger.info_once("Resolved Engram configuration: %s", str(self.engram_config))
 
     def _reject_mismatched_float_kv_cache(self) -> None:

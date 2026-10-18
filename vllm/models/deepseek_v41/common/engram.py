@@ -66,6 +66,7 @@ from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivati
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
+from vllm.model_executor.model_loader.checkpoint_rows import CheckpointRows
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.deepseek_v41.common.ops.query_quant import (
     can_fuse_query_quant,
@@ -959,13 +960,18 @@ class ParallelEngramEmbedding(nn.Module):
         cpu_offload: bool = False,
         dp_shared_memory: bool = False,
         use_thp: bool = False,
+        disk_offload: bool = False,
+        max_tokens: int = 0,
     ) -> None:
         super().__init__()
         assert head_sizes and all(size > 0 for size in head_sizes)
         assert sum(head_sizes) <= num_embeddings
+        if disk_offload and cpu_offload:
+            raise ValueError("disk_offload and cpu_offload are mutually exclusive")
         self.cpu_offload = cpu_offload
         self.dp_shared_memory = dp_shared_memory
         self.use_thp = use_thp
+        self.disk_offload = disk_offload
         self.dp_size = get_engram_dp_size()
         if dp_shared_memory:
             if not cpu_offload:
@@ -1002,16 +1008,40 @@ class ParallelEngramEmbedding(nn.Module):
         self._num_sms = torch.cuda.get_device_properties(
             torch.accelerator.current_device_index()
         ).multi_processor_count
+        self._disk: CheckpointRows | None = None
+        if disk_offload:
+            if self.dp_size > 1:
+                raise ValueError("disk_offload does not support embedding_across_dp")
+            self._disk = CheckpointRows(
+                "Engram weight", self.part_num_embeddings, torch.float8_e4m3fn
+            )
+            self._init_disk_staging(max_tokens)
         weight, scales = self._allocate_weights()
         self.weight = nn.Parameter(weight, requires_grad=False)
         self.weight_scale_inv = nn.Parameter(scales, requires_grad=False)
-        for param in (self.weight, self.weight_scale_inv):
+        weight_loader = self._load_disk_weight if disk_offload else self._weight_loader
+        for param, loader in (
+            (self.weight, weight_loader),
+            (self.weight_scale_inv, self._weight_loader),
+        ):
             set_weight_attrs(
                 param,
                 {
-                    "weight_loader": self._weight_loader,
+                    "weight_loader": loader,
                     "engram_vocab_start": self.vocab_start_idx,
                 },
+            )
+        if disk_offload:
+            # Dummy weights stage zero values; constant scales avoid randomizing
+            # the host scale table.
+            set_weight_attrs(self.weight_scale_inv, {"dummy_weight_value": 127})
+            logger.info(
+                "Engram values read from checkpoint files: %d rows x %d, %.2f GiB; "
+                "scales in host memory: %.2f GiB",
+                self.part_num_embeddings,
+                dim,
+                self.part_num_embeddings * dim / 1024**3,
+                self.part_num_embeddings * (dim // block_size) / 1024**3,
             )
         if cpu_offload:
             # Constant dummy values avoid randomizing huge CPU lookup tables.
@@ -1027,12 +1057,120 @@ class ParallelEngramEmbedding(nn.Module):
                 "shared across DP replicas" if dp_shared_memory else "per rank",
             )
 
+    def _init_disk_staging(self, max_tokens: int) -> None:
+        rows = max(1, max_tokens * self.part_n_hash_cols)
+        scale_dim = self.dim // self.block_size
+        device = torch.device("cuda", torch.accelerator.current_device_index())
+        # Model initialization may be inside a CUDA device context.
+        self._disk_distinct = torch.empty(
+            rows, self.dim, dtype=torch.uint8, device="cpu"
+        )
+        # Every output row's value and scale bytes, written only after the
+        # step's stream sync, so after the previous upload.
+        host = {"device": "cpu", "pin_memory": True}
+        self._disk_host = (
+            torch.empty(rows, self.dim, dtype=torch.uint8, **host),
+            torch.empty(rows, scale_dim, dtype=torch.uint8, **host),
+        )
+        self._disk_staged = (
+            torch.empty(rows, self.dim, dtype=torch.float8_e4m3fn, device=device),
+            torch.empty(rows, scale_dim, dtype=torch.uint8, device=device),
+        )
+        # Staged rows are compact, so the i-th staged row has id i.
+        self._disk_row_ids = torch.arange(rows, dtype=torch.int32, device=device)
+
+    def _load_disk_weight(
+        self, param: torch.nn.Parameter, loaded_weight: torch.Tensor
+    ) -> None:
+        assert self._disk is not None
+        self._disk.add(
+            0,
+            loaded_weight.narrow(0, self.vocab_start_idx, self.part_num_embeddings),
+            self.part_num_embeddings,
+        )
+
+    def finalize_disk(self, dummy: bool) -> None:
+        """Bind the checkpoint rows; dummy weights stage zero values instead."""
+        if self._disk is not None:
+            if dummy:
+                self._disk = None
+            else:
+                self._disk.bind()
+
+    def stage_disk_rows(self, ids: torch.Tensor, out: torch.Tensor) -> None:
+        """Read this rank's rows for host hash ids [tokens, n_hash_cols] from the
+        checkpoint and look them up into `out` as `lookup` does."""
+        num_tokens, heads = ids.shape[0], self.part_n_hash_cols
+        rows = num_tokens * heads
+        if not rows:
+            return
+        assert rows <= self._disk_row_ids.numel(), "Engram staging buffer too small"
+        local = (
+            ids[:, self.head_start : self.head_start + heads].long()
+            - self.vocab_start_idx
+        )
+        if (pad := heads - local.shape[1]) > 0:
+            local = nn.functional.pad(local, (0, pad), value=-1)
+        local = local.flatten()
+        owned = (local >= 0) & (local < self.part_num_embeddings)
+        local = torch.where(owned, local, 0)
+        values, scales = (plane[:rows] for plane in self._disk_host)
+        if self._disk is None:
+            values.zero_()
+        else:
+            distinct, inverse = local.unique(return_inverse=True)
+            buffer = self._disk_distinct[: distinct.numel()]
+            self._disk.read(distinct, buffer)
+            torch.index_select(buffer, 0, inverse, out=values)
+        torch.index_select(self.weight_scale_inv.data, 0, local, out=scales)
+        # Rows other ranks own look up as zeros, as in the resident tables.
+        values[~owned] = 0
+        scales[~owned] = 0
+        staged_values, staged_scales = (plane[:rows] for plane in self._disk_staged)
+        staged_values.view(torch.uint8).copy_(values, non_blocking=True)
+        staged_scales.copy_(scales, non_blocking=True)
+        row_ids = self._disk_row_ids[:rows].view(num_tokens, heads)
+        grid = min(triton.cdiv(rows, 16), self._num_sms)
+        _engram_lookup_kernel[(grid,)](
+            staged_values,
+            staged_scales,
+            row_ids,
+            row_ids,
+            out,
+            0,
+            rows,
+            rows,
+            heads,
+            1,
+            HEAD_START=0,
+            LOCAL_HEADS=heads,
+            TOTAL_HEADS=heads,
+            DIM=self.dim,
+            QUANT_BLOCK=self.block_size,
+            BLOCK_R=16,
+            GRID=grid,
+            SORTED=False,
+            PACKED=out.dtype == torch.uint8,
+            OUT_STRIDE=out.stride(0),
+        )
+
     def _get_shard_info(self) -> tuple[int, int]:
         if self.dp_size == 1:
             return self.tp_size, get_tensor_model_parallel_rank()
         return self.tp_size * self.dp_size, engram_head_shard_rank()
 
     def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.disk_offload:
+            # Values stay in the checkpoint; the 1/32-size scales stay in RAM.
+            return (
+                torch.empty(0, self.dim, dtype=torch.float8_e4m3fn),
+                torch.empty(
+                    self.part_num_embeddings,
+                    self.dim // self.block_size,
+                    dtype=torch.uint8,
+                    device="cpu",
+                ),
+            )
         if self.dp_shared_memory:
             group = get_engram_dp_group()
             assert group is not None
@@ -1114,6 +1252,7 @@ class ParallelEngramEmbedding(nn.Module):
 
         `background` limits the grid to leave SMs for concurrent work.
         """
+        assert not self.disk_offload, "disk-offloaded rows come from stage_disk_rows"
         rows = indices.shape[0] * self.part_n_hash_cols
         if not rows:
             return
@@ -1577,7 +1716,8 @@ class Engram(nn.Module):
     def _create_embedding(
         self, layout: EngramLayout, layer_hash_index: int
     ) -> ParallelEngramEmbedding:
-        engram_config = get_current_vllm_config().engram_config
+        vllm_config = get_current_vllm_config()
+        engram_config = vllm_config.engram_config
         assert engram_config is not None
         return ParallelEngramEmbedding(
             layout.num_embeddings[layer_hash_index],
@@ -1586,6 +1726,8 @@ class Engram(nn.Module):
             cpu_offload=engram_config.cpu_offload,
             dp_shared_memory=bool(engram_config.dp_shared_memory),
             use_thp=engram_config.use_thp,
+            disk_offload=engram_config.disk_offload,
+            max_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
         )
 
     def _init_staging(self, max_tokens: int, head_dim: int) -> None:
@@ -1612,6 +1754,12 @@ class Engram(nn.Module):
             self.embed_tokens.lookup(hash_ids, rows)
         else:
             self._start_prefetch(hash_ids, rows)
+
+    def stage_disk_rows(self, hash_ids: torch.Tensor) -> None:
+        """Stage disk-offloaded rows for host hash IDs before the forward."""
+        self.embed_tokens.stage_disk_rows(
+            hash_ids, self.staged_rows[: hash_ids.shape[0]]
+        )
 
     @eager_break_during_capture
     def _start_prefetch(self, hash_ids: torch.Tensor, rows: torch.Tensor) -> None:

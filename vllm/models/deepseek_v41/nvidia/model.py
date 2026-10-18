@@ -959,6 +959,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
+        engram_hashes: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -975,10 +976,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # Engram n-gram hashes for the whole (flattened) batch, computed once
         # on the full token stream — before any sequence-parallel sharding —
         # and consumed by the engram layers (1 and 14) below. Skipped on
-        # profile runs (KV cache unbound).
-        engram_hashes: torch.Tensor | None = None
+        # profile runs (KV cache unbound). With disk offload the model state
+        # hashed the batch and staged its rows before the forward.
         engram_mask: torch.Tensor | None = None
-        if (
+        if engram_hashes is not None:
+            engram_mask = ~image_sentinel_mask(input_ids)
+        elif (
             self.engram_hash is not None
             and input_ids is not None
             and is_forward_context_available()
@@ -1682,6 +1685,7 @@ class DeepseekV41LLMForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
+        engram_hashes: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.model(
             input_ids,
@@ -1689,6 +1693,7 @@ class DeepseekV41LLMForCausalLM(
             intermediate_tensors,
             inputs_embeds,
             lookback_token_ids=lookback_token_ids,
+            engram_hashes=engram_hashes,
         )
         return hidden_states
 
@@ -1720,6 +1725,13 @@ class DeepseekV41LLMForCausalLM(
 
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mhc_broadcast_weights()
+        dummy = self.model.vllm_config.load_config.load_format == "dummy"
+        for layer in islice(
+            self.model.layers, self.model.start_layer, self.model.end_layer
+        ):
+            engram = getattr(layer, "engram", None)
+            if engram is not None:
+                engram.embed_tokens.finalize_disk(dummy)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
